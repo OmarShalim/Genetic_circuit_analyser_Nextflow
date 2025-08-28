@@ -1,0 +1,17 @@
+# Raw sequencing data
+*.fastq
+*.fq
+*.fastq.gz
+*.fq.gz
+
+# Nextflow / pipeline outputs
+.nextflow*
+work/
+results/
+tmp/
+.cache/
+*.log
+
+# OS/editor junk
+.DS_Store
+*.swp
