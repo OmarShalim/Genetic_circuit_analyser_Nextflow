@@ -51,7 +51,6 @@ process CountReads {
     tuple val(sample_id), path(bam_file), path(count_script), path(settings_file)
 
     output:
-    // Emit per-sample tuple containing all files the cohort step will need
     tuple val(sample_id),
           path("${sample_id}.counts.txt"),
           path("${sample_id}.mapped.reads.txt"),
@@ -114,7 +113,6 @@ process ReadAnalysis {
 
     script:
     """
-    ls -l
     python3 ${bin_path}/read_analysis.py \\
         -settings ${settings_file} \\
         -bin_path ${bin_path}
@@ -124,7 +122,6 @@ process ReadAnalysis {
 /*
  * Fan-out the single norm factors file so each sample gets a copy
  * under results/<sample>/norm.factors.matrix.txt.
- * NOTE: Nextflow stages the input with the same basename; avoid copying onto itself.
  */
 process DistributeNormFactors {
     tag "$sample_id"
@@ -140,7 +137,6 @@ process DistributeNormFactors {
 
     script:
     """
-    # If the staged file already exists with this name, do nothing; otherwise copy it.
     if [ ! -e norm.factors.matrix.txt ]; then
         cp "${norm_factors}" norm.factors.matrix.txt
     fi
@@ -156,10 +152,11 @@ process TranscriptionProfile {
     tuple val(sample_id), path(frag_dist_file)
 
     output:
-    path("${sample_id}.rev.profiles.txt")
-    path("${sample_id}.fwd.profiles.txt")
-    path("${sample_id}.rev.norm.profiles.txt")
-    path("${sample_id}.fwd.norm.profiles.txt")
+    // Label outputs so we can address them individually downstream
+    path("${sample_id}.rev.profiles.txt"),       emit: rev_raw
+    path("${sample_id}.fwd.profiles.txt"),       emit: fwd_raw
+    path("${sample_id}.rev.norm.profiles.txt"),  emit: rev_norm
+    path("${sample_id}.fwd.norm.profiles.txt"),  emit: fwd_norm
 
     publishDir "results/${sample_id}", mode: 'copy', overwrite: true
 
@@ -169,6 +166,32 @@ process TranscriptionProfile {
         -settings ${settings_file} \\
         -samples ${sample_id} \\
         -chroms ${chroms}
+    """
+}
+
+/*
+ * NEW: CrypticSites — run once after ALL normalized profiles are produced.
+ * Uses the wrapper (cryptic_sites_nf.py) to arrange layout and call your detector.
+ */
+process CrypticSites {
+    tag "AllSamples"
+
+    input:
+    path norm_profiles   // collected list of *.norm.profiles.txt
+    path settings_file
+    path bin_path
+    path gff_file
+
+    output:
+    path "all_promoters_terminators_with_cryptics.txt", emit: cryptic_sites
+    path "results/*/*_clean_rugs_colored.png", optional: true, emit: cryptic_plots
+
+    publishDir ".", mode: 'copy', overwrite: true
+
+    script:
+    """
+    python3 ${bin_path}/cryptic_sites_nf.py \\
+        --gff ${gff_file}
     """
 }
 
@@ -197,6 +220,14 @@ workflow {
             names.unique()
         }
         .flatten()
+
+    // Extract a GFF path from the first non-header line in settings (3rd column)
+    gff_ch = Channel.fromPath(params.settings)
+        .map { f ->
+            def row = f.text.readLines().find { ln -> ln && !ln.startsWith("sample") && !ln.startsWith("None") }
+            def gffPath = row.split('\\t')[2].trim()
+            file(gffPath)
+        }
 
     sample_info = all_samples_ch.map { s -> tuple(s, file(params.settings), file(params.bin_path)) }
 
@@ -236,6 +267,12 @@ workflow {
         tuple(it[0], profile_script, settings_file, chroms)
     }
 
-    // Wire up profile: (per sample) × (norm factors per sample) × (frag dist per sample)
-    TranscriptionProfile(profile_input_ch, norm_factors_ch, fragdist_ch)
+    // Run profiles and capture labeled outputs
+    tp = TranscriptionProfile(profile_input_ch, norm_factors_ch, fragdist_ch)
+
+    // Gather ALL normalized profiles (rev + fwd), then run CrypticSites once
+    norm_profiles_list_ch = tp.rev_norm.mix(tp.fwd_norm).collect()
+
+    CrypticSites(norm_profiles_list_ch, settings_file, bin_path, gff_ch)
 }
+
